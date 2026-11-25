@@ -1,0 +1,10 @@
+.venv/
+models/
+__pycache__/
+*.bak
+# Local secrets written by `elevenlabs onboard`
+/.env.local
+
+# Personal data: your vocabulary (names, internal terms) and benchmark history
+transcriber/vocab.txt
+benchmarks.tsv

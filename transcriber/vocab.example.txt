@@ -1,0 +1,32 @@
+# Words the transcriber should expect: names, product/code terms, ticket numbers.
+# Copy this file to vocab.txt (install.sh does it) and fill in your own. vocab.txt is
+# git-ignored, so your colleagues' names and internal terms stay on your machine.
+#
+# One per line (max 5 words, 50 characters each; no < > { } [ ] \). '#' starts a comment.
+# Used by BOTH engines:
+#   ElevenLabs → sent as "keyterms" (first 100)
+#   local      → sent to Whisper as "hotwords" (a glossary prompt on every 30 s window;
+#                ~200 tokens max, so put the most important terms FIRST)
+#
+# Grow it with:  meetrec compare --all   (lists terms ElevenLabs got that local missed)
+
+# People / teams
+Priya
+Jonas
+Alex's team
+
+# Products / features
+Order History page
+Copilot
+REST API
+
+# Code / tech
+UserAccount
+UserAccountService
+findById
+OAuth2
+client_credentials
+RFC 6749
+
+# Tickets
+PROJ-1234

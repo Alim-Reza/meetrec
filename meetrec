@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# meetrec — record any meeting on Linux and transcribe it locally.
+#
+# This file only wires the modules together:
+#   voice-catcher/  recording (PipeWire → Opus)
+#   transcriber/    speech-to-text (faster-whisper)
+#   summarizer/     (planned)
+
+set -euo pipefail
+
+VERSION="1.3.0"
+MEETREC_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+source "$MEETREC_HOME/lib/common.sh"
+source "$MEETREC_HOME/config.env"
+source "$MEETREC_HOME/voice-catcher/catcher.sh"
+source "$MEETREC_HOME/transcriber/transcriber.sh"
+
+# A worker can die (reboot, kill) and leave markers behind. If nobody holds the
+# transcription lock, nothing is running, so "transcribing" markers are stale.
+clear_stale_markers() {
+  [[ -d "$MEETREC_DIR" ]] || return 0
+  ( flock -n 9 || exit 1
+    find "$MEETREC_DIR" -mindepth 2 -maxdepth 2 -name .transcribing -delete
+    find "$MEETREC_DIR" -mindepth 2 -maxdepth 2 -name .transcribe-queued -mmin +2 -delete
+  ) 9>"$TR_LOCK" 2>/dev/null || true
+}
+
+cmd_list() {
+  [[ -d "$MEETREC_DIR" ]] || { say "No recordings yet ($MEETREC_DIR)."; return 0; }
+  local d
+  printf '%s%-40s %-9s %-6s %s%s\n' "$c_dim" "RECORDING" "LENGTH" "SIZE" "TRANSCRIPTS" "$c_off"
+  for d in $(ls -1d "$MEETREC_DIR"/*/ 2>/dev/null | sort -r | head -"${1:-20}"); do
+    d="${d%/}"
+    local len="-" size="-" tr="" e
+    if [[ -f "$d/meeting.opus" ]]; then
+      local dur; dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$d/meeting.opus" 2>/dev/null || echo 0)
+      len=$(human_dur "${dur:-0}"); size=$(du -h "$d/meeting.opus" | cut -f1)
+      for e in 11 local; do
+        if [[ -f "$d/transcript_$e.md" ]]; then tr+="✔ $e  "
+        elif [[ -f "$d/.transcribing" || -f "$d/.transcribe-queued" ]] && [[ " $MEETREC_ENGINES " == *" $e "* ]]; then tr+="… $e  "
+        else tr+="✘ $e  "; fi
+      done
+      [[ -f "$d/.transcribe-queued" ]] && tr+="(queued)"
+      [[ -f "$d/.transcribing" ]] && tr+="(in progress)"
+    elif [[ -f "$d/others.raw" ]]; then
+      len="raw"; tr="(run: meetrec recover)"
+    fi
+    printf '%-40s %-9s %-6s %s\n' "$(basename "$d")" "$len" "$size" "$tr"
+  done
+}
+
+cmd_open() { # meetrec open [rec] [11|local] — open a transcript (default: first engine available)
+  local rec="" eng=""
+  for a in "$@"; do case "$a" in 11|local) eng="$a" ;; *) rec="$a" ;; esac; done
+  local d f=""; d=$(resolve_dir "$rec")
+  for e in ${eng:-$MEETREC_ENGINES}; do [[ -f "$d/transcript_$e.md" ]] && { f="$d/transcript_$e.md"; break; }; done
+  xdg-open "${f:-$d}" >/dev/null 2>&1 &
+  say "${f:-$d}"
+}
+
+cmd_doctor() {
+  local bad=0
+  check() { if command -v "$1" >/dev/null 2>&1; then ok "$1 ${c_dim}($(command -v "$1"))${c_off}"; else warn "$1 missing — $2"; bad=1; fi; }
+  say "voice-catcher:"
+  check pw-record   "sudo apt install pipewire-bin"
+  check wpctl       "sudo apt install wireplumber"
+  check ffmpeg      "sudo apt install ffmpeg"
+  check pactl       "sudo apt install pulseaudio-utils (optional, for debugging)"
+  check notify-send "sudo apt install libnotify-bin (optional, desktop notifications)"
+  # capture first: piping into `grep -q` + pipefail gives false failures (SIGPIPE)
+  local enc=""; command -v ffmpeg >/dev/null && enc=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+  if command -v ffmpeg >/dev/null && [[ "$enc" != *libopus* ]]; then warn "ffmpeg has no libopus encoder"; bad=1; fi
+  if systemctl --user is-active -q pipewire 2>/dev/null; then ok "PipeWire running"; else warn "PipeWire not running"; bad=1; fi
+  say "   default output: $(default_name @DEFAULT_AUDIO_SINK@)"
+  say "   default mic:    $(default_name @DEFAULT_AUDIO_SOURCE@)"
+  say "transcriber:"
+  if transcriber_ready; then
+    ok "faster-whisper $("$VENV_PY" -c 'import faster_whisper; print(faster_whisper.__version__)') ${c_dim}($MEETREC_HOME/.venv)${c_off}"
+  else
+    warn "faster-whisper not installed — run ./install.sh"; bad=1
+  fi
+  if [[ -n "$(find "$MEETREC_MODELS_DIR" -name model.bin 2>/dev/null | head -1)" ]]; then
+    ok "model files in $MEETREC_MODELS_DIR ${c_dim}($(du -sh "$MEETREC_MODELS_DIR" | cut -f1))${c_off}"
+  else
+    warn "no model downloaded yet — run ./install.sh (or it downloads on first transcription)"
+  fi
+  say "   local model: $MEETREC_MODEL · language: $MEETREC_LANG"
+  if [[ " $MEETREC_ENGINES " == *" 11 "* ]]; then
+    if transcriber_ready && "$VENV_PY" -c "import elevenlabs" 2>/dev/null; then
+      ok "ElevenLabs SDK $("$VENV_PY" -c 'from importlib.metadata import version; print(version("elevenlabs"))')"
+    else
+      warn "ElevenLabs SDK not installed — run ./install.sh"; bad=1
+    fi
+    # checks the key is present without printing it
+    if "$VENV_PY" -c "import os,sys; from dotenv import load_dotenv; load_dotenv('$MEETREC_HOME/.env.local'); sys.exit(0 if os.environ.get('ELEVENLABS_API_KEY') else 1)" 2>/dev/null; then
+      ok "ElevenLabs API key found ${c_dim}(.env.local)${c_off}"
+    else
+      warn "No ElevenLabs API key — run: npx -y @elevenlabs/cli@latest onboard init  (in $MEETREC_HOME)"; bad=1
+    fi
+    say "   ElevenLabs model: $MEETREC_11_MODEL · keyterms: $(grep -cvE '^\s*(#|$)' "$MEETREC_HOME/transcriber/vocab.txt" 2>/dev/null || echo 0) in transcriber/vocab.txt"
+  fi
+  say "   engines: $MEETREC_ENGINES · auto-transcribe: $MEETREC_AUTO_TRANSCRIBE"
+  say "   recordings: $MEETREC_DIR"
+  (( bad )) && { warn "Some checks failed."; return 1; }
+  ok "All good."
+}
+
+cmd_help() {
+  cat <<EOF
+meetrec $VERSION — record any meeting (Teams, Chrome, Zoom, …) and transcribe it locally
+
+Recording
+  meetrec start [name]     start recording (optional name, e.g. "standup")
+  meetrec stop             stop, save audio, then transcribe in the background
+  meetrec toggle [name]    start/stop in one command (Super+Shift+R)
+  meetrec recover          finish recordings interrupted by a crash or reboot
+
+Transcripts  (engines: 11 = ElevenLabs → transcript_11.*, local = Whisper → transcript_local.*)
+  meetrec transcribe [rec] [--engine 11|local]   transcribe now (default: latest, all engines)
+  meetrec transcribe --missing [--engine …]      fill in every missing transcript
+  meetrec open [rec] [11|local]                  open a transcript (default: latest)
+
+Improving the local engine
+  meetrec compare [rec … | --all] [--log]   local vs ElevenLabs: error rate, mistakes, vocab ideas
+  meetrec vocab            edit transcriber/vocab.txt (names & jargon for both engines)
+
+Info
+  meetrec status           recording? transcriptions running/queued?
+  meetrec list [N]         last N recordings with transcript status
+  meetrec doctor           check dependencies, devices, model
+
+Settings: $MEETREC_HOME/config.env
+Recordings: $MEETREC_DIR
+EOF
+}
+
+clear_stale_markers
+
+case "${1:-help}" in
+  start)      shift; catcher_start "$@" ;;
+  stop)       catcher_stop ;;
+  toggle)     shift; if is_running; then catcher_stop; else catcher_start "$@"; fi ;;
+  status)     catcher_status; transcriber_status ;;
+  list|ls)    shift; cmd_list "$@" ;;
+  recover)    catcher_recover ;;
+  transcribe) shift; cmd_transcribe "$@" ;;
+  open)       shift; cmd_open "$@" ;;
+  compare)    shift; cmd_compare "$@" ;;
+  vocab)      f="$MEETREC_HOME/transcriber/vocab.txt"
+              if [[ -t 0 ]]; then "${VISUAL:-${EDITOR:-nano}}" "$f"; else xdg-open "$f" >/dev/null 2>&1 & fi
+              say "$f" ;;
+  doctor)     cmd_doctor ;;
+  _transcribe-worker) shift; transcriber_worker "$1" ;;
+  -v|--version|version) say "meetrec $VERSION" ;;
+  help|-h|--help) cmd_help ;;
+  *) cmd_help; exit 1 ;;
+esac
